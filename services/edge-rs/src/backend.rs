@@ -1363,7 +1363,7 @@ mod tests {
         let r = get("main.test", "/data.txt", &[]).await;
         assert_eq!(
             (r.h("x-custom"), r.h("cache-control")),
-            (Some("yes"), Some("public, max-age=86400"))
+            (Some("yes"), Some("public, max-age=0, must-revalidate"))
         );
         assert_eq!(r.h("vary"), None);
         let r = get("main.test", "/_astro/app.a1b2c3d4.js", &[]).await;
