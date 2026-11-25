@@ -266,38 +266,78 @@ pub fn match_redirect(rule: &RedirectRule, pathname: &str) -> Option<String> {
     Some(to)
 }
 
-/// A build-tool content-fingerprint token: one `.`/`-`/`_`-delimited piece of
-/// the filename that is 8+ characters and mixes letters with digits.
+/// Does the file name carry a build-tool content hash? Two rules, both on the name only
+/// (no directory guesses: `/assets/logo.svg` is a user file, `/_astro/x.css` could be too).
+///
+/// 1. A `.`/`-`/`_`-delimited piece of 8+ characters that mixes letters with digits
+///    (webpack, Next, Vite, Astro hashes that happen to contain a digit).
+/// 2. Exactly 8 base64url characters shaped `name.HASH.ext` or `name-HASH.ext`
+///    (Astro, Vite, Rolldown). With a digit they must mix upper and lower case (this
+///    catches hashes cut up by their own `-`/`_`, as in `DDw8VC-O`). Without a digit (about
+///    1 in 5 hashes) they must look random: 3+ upper case, a lower case and 2+ case changes. A word
+///    (`document`, `Facebook`, `MyButton`), an acronym (`HTMLView`) or a constant
+///    (`OVERVIEW`) fails at least one test. A miss only costs a revalidation.
 fn is_fingerprinted(asset_key: &str) -> bool {
     let filename = asset_key.rsplit('/').next().unwrap_or("");
-    filename.split(['.', '-', '_']).any(|token| {
+    let digit_token = filename.split(['.', '-', '_']).any(|token| {
         token.chars().count() >= 8
             && token.bytes().any(|b| b.is_ascii_digit())
             && token.bytes().any(|b| b.is_ascii_alphabetic())
+    });
+    digit_token || has_letters_only_hash(filename.as_bytes())
+}
+
+fn has_letters_only_hash(name: &[u8]) -> bool {
+    const LEN: usize = 8;
+    // delimiter before (with a name in front of it), `.` after (an extension follows)
+    (1..name.len().saturating_sub(LEN)).any(|start| {
+        matches!(name[start - 1], b'.' | b'-')
+            && start >= 2
+            && name[start + LEN] == b'.'
+            && looks_random(&name[start..start + LEN])
     })
 }
 
-/// `Cache-Control` for an edge-served static asset.
+fn looks_random(token: &[u8]) -> bool {
+    if !token
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return false;
+    }
+    let digits = token.iter().filter(|b| b.is_ascii_digit()).count();
+    let upper = token.iter().filter(|b| b.is_ascii_uppercase()).count();
+    let lower = token.iter().filter(|b| b.is_ascii_lowercase()).count();
+    if digits > 0 {
+        // `DDw8VC-O`: the digit rule again, for hashes whose own `-`/`_` split them up
+        return upper >= 1 && lower >= 1;
+    }
+    let flips = token
+        .windows(2)
+        .filter(|w| {
+            w[0].is_ascii_alphabetic()
+                && w[1].is_ascii_alphabetic()
+                && w[0].is_ascii_uppercase() != w[1].is_ascii_uppercase()
+        })
+        .count();
+    upper + lower >= 6 && upper >= 3 && lower >= 1 && flips >= 2
+}
+
+/// `Cache-Control` for an edge-served static asset, Cloudflare Workers static assets semantics:
+/// `public, max-age=0, must-revalidate` (the ETag is the content hash, so a revalidation is a
+/// 304), and `immutable` only for names we can prove carry a content hash.
 pub fn cache_control_for(asset_key: &str) -> &'static str {
     if is_fingerprinted(asset_key) {
         "public, max-age=31536000, immutable"
     } else {
-        "public, max-age=86400"
+        "public, max-age=0, must-revalidate"
     }
 }
 
-/// `Cache-Control` in backend mode: fingerprinted names are immutable, HTML always revalidates
-/// (the page may change under a stable name), everything else keeps for a day.
-pub fn cache_control_backend(asset_key: &str, content_type: &str) -> &'static str {
-    if is_fingerprinted(asset_key) {
-        return "public, max-age=31536000, immutable";
-    }
-    let essence = content_type.split(';').next().unwrap_or("").trim();
-    if essence.eq_ignore_ascii_case("text/html") {
-        "public, max-age=0, must-revalidate"
-    } else {
-        "public, max-age=86400"
-    }
+/// `Cache-Control` in backend mode: the same policy (a page may change under a stable name,
+/// and so may any other file).
+pub fn cache_control_backend(asset_key: &str, _content_type: &str) -> &'static str {
+    cache_control_for(asset_key)
 }
 
 #[cfg(test)]
@@ -340,7 +380,7 @@ mod tests {
         );
         assert_eq!(
             cache_control_backend("/logo.svg", "image/svg+xml"),
-            "public, max-age=86400"
+            "public, max-age=0, must-revalidate"
         );
         assert_eq!(
             cache_control_backend("/_astro/index.Ke7awTe2.css", "text/css"),
@@ -395,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_names_get_a_day() {
+    fn plain_names_revalidate() {
         for key in [
             "/fonts/bricolage-grotesque-latin.woff2",
             "/fonts/jetbrains-mono-latin.woff2",
@@ -403,8 +443,172 @@ mod tests {
             "/logo.svg",
             "/og/home.png",
             "/robots.txt",
+            "/app.css",
         ] {
-            assert_eq!(cache_control_for(key), "public, max-age=86400", "{key}");
+            assert_eq!(
+                cache_control_for(key),
+                "public, max-age=0, must-revalidate",
+                "{key}"
+            );
+        }
+    }
+
+    /// Hashed names from real builds: Astro 5 and Rolldown (site, docs), Vite 7 (cloud
+    /// dashboard) and TanStack Start (sproutboat web), all read from `dist` folders on
+    /// 2026-11-25, plus the Next.js and webpack/CRA shapes. Letters-only hashes are the
+    /// ones the old digit rule missed.
+    const HASHED: &[&str] = &[
+        // Astro, letters only
+        "/_astro/Layout.BQLfoQtT.css",
+        "/_astro/Layout.DfzoWvmC.css",
+        "/_astro/Layout.DRiDnmKM.css",
+        "/_astro/Layout.ByiY2IYt.css",
+        "/_astro/Layout.YyuW9mWK.css",
+        "/_astro/Layout.DEjbHM9L.css",
+        "/_astro/Layout.BjOrbay8.css",
+        "/_astro/Docs.8mcaNtnL.css",
+        "/_astro/BlockPreview.CYGfpe6A.js",
+        "/_astro/CompositeRoot.CtsK4fip.js",
+        "/_astro/DialogTitle.CNfq8uXU.js",
+        "/_astro/HomeShowcase.CFVGlQ9t.js",
+        "/_astro/pure.DtvNgFTA.js",
+        "/_astro/page.CZh4tvAt.js",
+        "/_astro/scene.BetpJ0YL.js",
+        "/_astro/prefetch.ChQ6Rgti.js",
+        "/_astro/instrument-serif-italic.DKMiL14s.woff2",
+        "/_astro/MessageComposer.astro_astro_type_script_index_0_lang.DDw8VC-O.js",
+        "/_astro/PanelTabs.astro_astro_type_script_index_0_lang.CxIN-ILs.js",
+        "/_astro/PageActions.astro_astro_type_script_index_0_lang.hIdOPHzl.js",
+        "/_astro/Hero.astro_astro_type_script_index_0_lang.zqgYOFP0.js",
+        // Astro, with a digit
+        "/_astro/_..CMaAEJG5.css",
+        "/_astro/chrome-icons.5Dk-A2Gq.js",
+        "/_astro/esm.b0x1Q25u.js",
+        "/_astro/how.BB7s_qJ3.css",
+        "/_astro/validate-json.C6aK2IaD.js",
+        "/_astro/WebMcp.astro_astro_type_script_index_0_lang.D9N1Gby_.js",
+        // Vite, both kinds
+        "/assets/index-DVmHr4mN.css",
+        "/assets/index-OQv5BlF8.js",
+        "/assets/esm-D8nwNgJn.js",
+        "/assets/figtree-latin-wght-normal-D_ZTVpCC.woff2",
+        "/assets/jetbrains-mono-latin-wght-normal-B9CIFXIH.woff2",
+        "/assets/preload-helper-PMedUJL0.js",
+        "/assets/settings.tokens-CvZ6DdJy.js",
+        "/assets/projects_._name.deployments-HjljbiU6.js",
+        "/assets/admin.users-Z7OKpJPu.js",
+        // Next.js, webpack, SvelteKit, Nuxt (hex or digit-bearing)
+        "/_next/static/chunks/main-app-4f5a6b7c8d9e0a1b.js",
+        "/_next/static/chunks/webpack-5d1c2e3f4a5b6c7d.js",
+        "/_next/static/css/5a3b9c1d2e4f6a7b.css",
+        "/_next/static/media/e4af272ccee01ff0-s.p.woff2",
+        "/static/js/main.8f3a2b1c.chunk.js",
+        "/_app/immutable/chunks/0.b2c3d4e5.js",
+        "/_nuxt/entry.c3d4e5f6.js",
+    ];
+
+    /// Names that must never be called fingerprinted: real public files from the
+    /// same builds, plus the ones a naive "mixed case, 8 letters" rule would catch.
+    const PLAIN: &[&str] = &[
+        "/index.html",
+        "/404.html",
+        "/favicon.svg",
+        "/favicon.ico",
+        "/apple-touch-icon.png",
+        "/robots.txt",
+        "/sitemap.xml",
+        "/install.sh",
+        "/schema.json",
+        "/_headers",
+        "/LICENSE",
+        "/app.css",
+        "/analytics-engine.json",
+        "/agent-readability.json",
+        "/ai-catalog.json",
+        "/chart-wide-dark-1440.webp",
+        "/chart-raft-light-390.webp",
+        "/fonts/bricolage-grotesque-latin.woff2",
+        "/fonts/jetbrains-mono-latin.woff2",
+        "/_astro/fonts/jetbrains-mono.woff2",
+        "/og/home.png",
+        // eight-letter words and names after a delimiter
+        "/docs-overview.pdf",
+        "/my-document.pdf",
+        "/user.profile.json",
+        "/logo-Facebook.png",
+        "/logo.Facebook.png",
+        "/icons/icon-MyButton.svg",
+        "/img/hero-HTMLView.png",
+        "/docs-OVERVIEW.pdf",
+        "/x.UserCard.js",
+        "/jquery.minified.js",
+        "/react-dom.production.min.js",
+        "/jquery-3.7.1.min.js",
+        "/v1.2.3/app.js",
+        "/en-US.json",
+        "/Roboto-Regular.woff2",
+        "/Inter-SemiBold.woff2",
+        "/NotoSansJP-Regular.otf",
+        "/README.md",
+        // a directory that looks hashed does not make its files hashed
+        "/Layout.BQLfoQtT/logo.svg",
+        "/assets/logo.svg",
+        "/_astro/logo.svg",
+        "/_next/static/logo.png",
+    ];
+
+    #[test]
+    fn real_build_hashes_are_immutable() {
+        let forever = "public, max-age=31536000, immutable";
+        for key in HASHED {
+            assert_eq!(cache_control_for(key), forever, "{key}");
+            assert_eq!(cache_control_backend(key, "text/css"), forever, "{key}");
+        }
+    }
+
+    #[test]
+    fn plain_corpus_is_never_immutable() {
+        for key in PLAIN {
+            assert_eq!(
+                cache_control_for(key),
+                "public, max-age=0, must-revalidate",
+                "{key}"
+            );
+        }
+    }
+
+    /// Real hashes the rule does not claim: with no digit and a `-`/`_` inside, a hash
+    /// like `DBQx-q_a` looks the same as `CSS-Grid`. They revalidate, which is safe.
+    #[test]
+    fn ambiguous_hashes_stay_revalidating() {
+        for key in [
+            "/assets/jetbrains-mono-latin-ext-wght-normal-DBQx-q_a.woff2",
+            "/assets/projects_._name--ao-MJ-C.js",
+            "/assets/root-DLTE-HSj.js",
+            "/guide-CSS-Grid.pdf",
+        ] {
+            assert_eq!(
+                cache_control_for(key),
+                "public, max-age=0, must-revalidate",
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn letters_only_hash_needs_name_and_extension() {
+        // a bare token, no name in front or no extension behind, is not a hash
+        for key in [
+            "/BQLfoQtT.css",
+            "/.BQLfoQtT.css",
+            "/Layout.BQLfoQtT",
+            "/Layout.BQLfoQtTx.css",
+        ] {
+            assert_eq!(
+                cache_control_for(key),
+                "public, max-age=0, must-revalidate",
+                "{key}"
+            );
         }
     }
 
