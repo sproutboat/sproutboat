@@ -235,12 +235,17 @@ impl Slot {
     }
 
     fn try_take_from(counter: &'static AtomicUsize, max: usize) -> Option<Slot> {
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Slot(counter))
+        // A compare-and-swap loop rather than `fetch_update`, which newer toolchains deprecate for `try_update`.
+        let mut n = counter.load(Ordering::Acquire);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match counter.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Slot(counter)),
+                Err(seen) => n = seen,
+            }
+        }
     }
 }
 
