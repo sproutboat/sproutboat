@@ -8,6 +8,7 @@ mod assets;
 mod backend;
 mod body;
 mod cache;
+mod compress;
 mod config;
 mod cookie_guard;
 mod idle;

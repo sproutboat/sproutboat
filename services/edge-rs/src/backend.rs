@@ -1182,6 +1182,27 @@ mod tests {
 
     const HTML: &str = "text/html; charset=utf-8";
 
+    /// An identity text asset with no precompressed variant, big enough to be compressed on the fly.
+    fn page() -> String {
+        "<p>a page that compresses well, repeated, repeated, repeated</p>\n".repeat(60)
+    }
+
+    /// The body of a chunked reply, de-chunked.
+    fn dechunk(raw: &[u8]) -> Vec<u8> {
+        let (mut out, mut rest) = (Vec::new(), raw);
+        loop {
+            let eol = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+            let size = usize::from_str_radix(std::str::from_utf8(&rest[..eol]).unwrap().trim(), 16)
+                .unwrap();
+            rest = &rest[eol + 2..];
+            if size == 0 {
+                return out;
+            }
+            out.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+
     fn put_blob(dir: &Path, name: &str, bytes: &[u8]) {
         std::fs::write(dir.join("blobs").join(name), bytes).unwrap();
     }
@@ -1206,6 +1227,7 @@ mod tests {
         put_blob(root, "rul00001", b"rules identity");
         put_blob(root, "rulbr001", b"RULES-BR");
         put_blob(root, "novar001", b"no variant on disk");
+        put_blob(root, "pagebig1", page().as_bytes());
         std::fs::write(root.join("blobs/big00001"), vec![7u8; 300_000]).unwrap();
         let file = |hash: &str, ty: &str, more: &str| {
             format!(r#"{{"hash":"{hash}","size":1,"type":"{ty}"{more}}}"#)
@@ -1222,7 +1244,8 @@ mod tests {
               "/big.bin":{},
               "/ghost.txt":{},
               "/rules.html":{},
-              "/novar.html":{}
+              "/novar.html":{},
+              "/page.html":{}
             }},
             "headers":[{{"pattern":"/data.txt","set":[["x-custom","yes"]],"unset":[]}},
               {{"pattern":"/rules.html","set":[["Vary","Origin"],["Content-Encoding","gzip"],["x-rule","1"]],"unset":[]}},
@@ -1242,6 +1265,7 @@ mod tests {
             file("ghost001", "text/plain", ""),
             file("rul00001", HTML, r#","br":{"hash":"rulbr001","size":8}"#),
             file("novar001", HTML, r#","br":{"hash":"nobr00001","size":8}"#),
+            file("pagebig1", HTML, ""),
         );
         let spa = format!(
             r#"{{"notFound":"single-page-application","runSproutFirst":false,"files":{{"/index.html":{},"/docs/index.html":{}}}}}"#,
@@ -1318,6 +1342,69 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(crate::server::serve(app.clone(), listener));
         Edge { addr, app, dir }
+    }
+
+    #[tokio::test]
+    async fn an_asset_without_a_precompressed_variant_is_compressed_on_the_way_out() {
+        use std::io::Read;
+        let backend = echo_backend().await;
+        let edge = start_edge(backend, &[]).await;
+        let get = |path: &'static str, extra: &'static [(&'static str, &'static str)]| {
+            send(edge.addr, "GET", path, "main.test", extra, "")
+        };
+        // gzip for a gzip client, with a weak validator and a chunked body
+        let r = get("/page.html", &[("Accept-Encoding", "gzip")]).await;
+        assert_eq!((r.status, r.h("content-encoding")), (200, Some("gzip")));
+        assert_eq!(r.h("etag"), Some("W/\"pagebig1\""));
+        assert_eq!(r.h("vary"), Some("accept-encoding"));
+        assert_eq!(r.h("content-length"), None);
+        assert_eq!(r.h("accept-ranges"), None);
+        let mut back = String::new();
+        flate2::read::GzDecoder::new(&dechunk(&r.body)[..])
+            .read_to_string(&mut back)
+            .unwrap();
+        assert_eq!(back, page());
+        // revalidation works with the weak form the client now holds, and with the strong one
+        for inm in ["W/\"pagebig1\"", "\"pagebig1\""] {
+            let extra = [("Accept-Encoding", "gzip"), ("If-None-Match", inm)];
+            let r = send(edge.addr, "GET", "/page.html", "main.test", &extra, "").await;
+            assert_eq!((r.status, r.body.len()), (304, 0), "{inm}");
+        }
+        // identity for a client that takes nothing, strong validator, same Vary
+        let r = get("/page.html", &[]).await;
+        assert_eq!(
+            (r.status, r.h("content-encoding"), r.h("etag")),
+            (200, None, Some("\"pagebig1\""))
+        );
+        assert_eq!(
+            (r.h("vary"), r.h("content-length")),
+            (
+                Some("accept-encoding"),
+                Some(page().len().to_string().as_str())
+            )
+        );
+        // a range is answered from the identity bytes
+        let r = get(
+            "/page.html",
+            &[("Accept-Encoding", "gzip"), ("Range", "bytes=0-2")],
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.h("content-encoding"), r.text()),
+            (206, None, "<p>".to_string())
+        );
+        // precompressed variants are served as they are, never encoded twice
+        let r = get("/", &[("Accept-Encoding", "gzip, br")]).await;
+        assert_eq!(
+            (r.text(), r.h("content-encoding")),
+            ("BR-bytes".to_string(), Some("br"))
+        );
+        // an opaque type is not compressed
+        let r = get("/big.bin", &[("Accept-Encoding", "gzip, br")]).await;
+        assert_eq!(
+            (r.status, r.h("content-encoding"), r.body.len()),
+            (200, None, 300_000)
+        );
     }
 
     #[tokio::test]

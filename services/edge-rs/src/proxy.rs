@@ -334,7 +334,22 @@ pub async fn handle(
     req: Request<Incoming>,
 ) -> Result<Response<RBody>, Infallible> {
     let hold = ctl.hold();
+    // Backend mode compresses on the way out (compress.rs): what it needs from the request is read
+    // before the request moves.
+    let compress = app.cfg.compress.then(|| {
+        (
+            header_joined(req.headers(), "accept-encoding"),
+            req.method().clone(),
+            req.headers().contains_key("range"),
+        )
+    });
     let res = handle_request(app, ctl, peer, req).await;
+    let res = match compress {
+        Some((accept, method, ranged)) => {
+            crate::compress::apply(res, accept.as_deref(), &method, ranged)
+        }
+        None => res,
+    };
     Ok(res.map(|body| Held::new(body, hold).boxed_unsync()))
 }
 
