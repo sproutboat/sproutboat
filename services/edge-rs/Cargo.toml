@@ -38,6 +38,8 @@ tokio = { version = "1", features = [
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 tokio-util = { version = "0.7", features = ["io"] }
 url = "2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+brotli = { version = "8", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

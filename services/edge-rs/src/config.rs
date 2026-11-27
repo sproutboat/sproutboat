@@ -28,6 +28,9 @@ pub struct Config {
     /// hosts under it may not name a `Domain` wider than their own account
     /// (`<account>.<apps domain>`). `None` (unset) is off.
     pub apps_domain: Option<String>,
+    /// Backend mode: compress compressible responses (`br`, `gzip`) for clients that accept it.
+    /// On by default; `SPROUTBOAT_EDGE_COMPRESS=off` turns it off. Always false in Community mode.
+    pub compress: bool,
 }
 
 /// A non-negative whole number; unset, empty and garbage fall back, and an explicit 0 stays 0.
@@ -134,6 +137,8 @@ impl Config {
             .map(|raw| raw.trim().trim_matches('.').to_lowercase())
             .filter(|d| !d.is_empty())
             .filter(|_| backend.is_some());
+        let compress =
+            backend.is_some() && get("SPROUTBOAT_EDGE_COMPRESS").as_deref() != Some("off");
         Ok(Config {
             port,
             bind_host: env_or_empty(&get, "SPROUTBOAT_BIND_HOST")
@@ -153,6 +158,7 @@ impl Config {
             dashboard_url,
             activation_dir: env_or_empty(&get, "SPROUTBOAT_ACTIVATION_DIR"),
             backend,
+            compress,
             apps_domain,
             asset_cache_bytes: bytes_or(&get, "SPROUTBOAT_ASSET_CACHE_BYTES", 64 * 1024 * 1024),
             asset_cache_entry_bytes: bytes_or(
